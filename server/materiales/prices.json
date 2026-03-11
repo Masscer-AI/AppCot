@@ -1,0 +1,95 @@
+{
+    "materiales": {
+        "tapas": [
+            {
+                "name": "Amilen ML",
+                "prices_by_micras": {
+                    "50": {
+                        "espesor_milesimas": 2.0,
+                        "price": 30.89,
+                        "price_unit": "USD",
+                        "density_g_m2": 48.7
+                    },
+                    "60": {
+                        "espesor_milesimas": 2.4,
+                        "price": 36.43,
+                        "price_unit": "USD",
+                        "density_g_m2": 58.6
+                    },
+                    "70": {
+                        "espesor_milesimas": 2.8,
+                        "price": 42.43,
+                        "price_unit": "USD",
+                        "density_g_m2": 68.5
+                    },
+                    "80": {
+                        "espesor_milesimas": 3.1,
+                        "price": 50.91,
+                        "price_unit": "USD",
+                        "density_g_m2": 79.0
+                    },
+                    "90": {
+                        "espesor_milesimas": 3.5,
+                        "price": 56.75,
+                        "price_unit": "USD",
+                        "density_g_m2": 88.7
+                    },
+                    "100": {
+                        "espesor_milesimas": 3.9,
+                        "price": 61.68,
+                        "price_unit": "USD",
+                        "density_g_m2": 98.3
+                    },
+                    "120": {
+                        "espesor_milesimas": 4.7,
+                        "price": 74.62,
+                        "price_unit": "USD",
+                        "density_g_m2": 118.3
+                    },
+                    "135": {
+                        "espesor_milesimas": 5.3,
+                        "price": 83.59,
+                        "price_unit": "USD",
+                        "density_g_m2": 133.2
+                    },
+                    "150": {
+                        "espesor_milesimas": 5.9,
+                        "price": 92.96,
+                        "price_unit": "USD",
+                        "density_g_m2": 147.9
+                    },
+                    "170": {
+                        "espesor_milesimas": 6.7,
+                        "price": 104.05,
+                        "price_unit": "USD",
+                        "density_g_m2": 167.7
+                    },
+                    "180": {
+                        "espesor_milesimas": 7.1,
+                        "price": 110.49,
+                        "price_unit": "USD",
+                        "density_g_m2": 177.2
+                    },
+                    "200": {
+                        "espesor_milesimas": 7.9,
+                        "price": 122.73,
+                        "price_unit": "USD",
+                        "density_g_m2": 197.5
+                    },
+                    "230": {
+                        "espesor_milesimas": 9.1,
+                        "price": 143.95,
+                        "price_unit": "USD",
+                        "density_g_m2": 227.7
+                    },
+                    "250": {
+                        "espesor_milesimas": 9.8,
+                        "price": 155.81,
+                        "price_unit": "USD",
+                        "density_g_m2": 247.1
+                    }
+                }
+            }
+        ]
+    }
+}
