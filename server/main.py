@@ -1,25 +1,24 @@
 from pathlib import Path
-from shutil import copy2
 from tempfile import NamedTemporaryFile
 from typing import Annotated
 from datetime import datetime
 import json
-import re
-import random
 
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
-from openpyxl import load_workbook
+from openpyxl import Workbook
+from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from pydantic import BaseModel, ConfigDict, Field
 from starlette.background import BackgroundTask
 import uvicorn
 
 
 BASE_DIR = Path(__file__).resolve().parent
-TEMPLATE_PATH = BASE_DIR / "materiales" / "template.xlsx"
 PRICES_PATH = BASE_DIR / "materiales" / "prices.json"
-TARGET_SHEET_NAME = "Fromato No. 1"
+TARGET_SHEET_NAME = "Formato No. 1"
+MAX_ITEMS = 4
+COMMISSION_FACTOR = 1.15
 SPANISH_MONTHS = {
     1: "Enero",
     2: "Febrero",
@@ -40,7 +39,6 @@ def remove_temp_file(path: str) -> None:
     try:
         Path(path).unlink(missing_ok=True)
     except OSError:
-        # If cleanup fails we do not fail the API response.
         pass
 
 
@@ -53,7 +51,6 @@ def get_today_date_spanish() -> str:
 def parse_excel_number(value: str | int | float | None) -> int | float | None:
     if value is None:
         return None
-
     if isinstance(value, int):
         return value
     if isinstance(value, float):
@@ -62,7 +59,6 @@ def parse_excel_number(value: str | int | float | None) -> int | float | None:
     text = str(value).strip().replace(",", "")
     if not text:
         return None
-
     try:
         parsed = float(text)
         return int(parsed) if parsed.is_integer() else parsed
@@ -70,87 +66,54 @@ def parse_excel_number(value: str | int | float | None) -> int | float | None:
         return None
 
 
-def clear_product_block(sheet, start_row: int, end_row: int, start_col: str = "B", end_col: str = "W") -> None:
-    for row in range(start_row, end_row + 1):
-        for col_ord in range(ord(start_col), ord(end_col) + 1):
-            sheet[f"{chr(col_ord)}{row}"] = None
+def clear_product_row(sheet, row: int, start_col: str = "B", end_col: str = "M") -> None:
+    for col_ord in range(ord(start_col), ord(end_col) + 1):
+        sheet[f"{chr(col_ord)}{row}"] = None
+
+
+def get_material_record(material_name: str) -> dict | None:
+    if not PRICES_PATH.exists():
+        return None
+    try:
+        with PRICES_PATH.open("r", encoding="utf-8") as file:
+            prices_data = json.load(file)
+    except Exception:  # noqa: BLE001
+        return None
+
+    tapas = prices_data.get("materiales", {}).get("tapas", [])
+    return next(
+        (item for item in tapas if str(item.get("name", "")).strip().lower() == material_name.strip().lower()),
+        None,
+    )
 
 
 def get_milesimas_for_material(material_name: str, calibre_micras: str) -> str | None:
-    if not PRICES_PATH.exists():
-        return None
-
-    micras_key = calibre_micras.strip()
-    if not micras_key:
-        return None
-
-    try:
-        micras_key = str(int(float(micras_key)))
-    except ValueError:
-        return None
-
-    try:
-        with PRICES_PATH.open("r", encoding="utf-8") as file:
-            prices_data = json.load(file)
-    except Exception:  # noqa: BLE001
-        return None
-
-    tapas = prices_data.get("materiales", {}).get("tapas", [])
-    material = next(
-        (item for item in tapas if str(item.get("name", "")).strip().lower() == material_name.strip().lower()),
-        None,
-    )
+    material = get_material_record(material_name)
     if material is None:
         return None
-
+    try:
+        micras_key = str(int(float(calibre_micras.strip())))
+    except ValueError:
+        return None
     values = material.get("prices_by_micras", {}).get(micras_key)
-    if values is None:
+    if values is None or values.get("espesor_milesimas") is None:
         return None
-
-    milesimas_raw = values.get("espesor_milesimas")
-    if milesimas_raw is None:
-        return None
-
-    return f"{float(milesimas_raw):.1f}"
+    return f"{float(values['espesor_milesimas']):.1f}"
 
 
 def get_price_for_material(material_name: str, calibre_micras: str) -> float | None:
-    if not PRICES_PATH.exists():
-        return None
-
-    micras_key = calibre_micras.strip()
-    if not micras_key:
-        return None
-
-    try:
-        micras_key = str(int(float(micras_key)))
-    except ValueError:
-        return None
-
-    try:
-        with PRICES_PATH.open("r", encoding="utf-8") as file:
-            prices_data = json.load(file)
-    except Exception:  # noqa: BLE001
-        return None
-
-    tapas = prices_data.get("materiales", {}).get("tapas", [])
-    material = next(
-        (item for item in tapas if str(item.get("name", "")).strip().lower() == material_name.strip().lower()),
-        None,
-    )
+    material = get_material_record(material_name)
     if material is None:
         return None
-
-    values = material.get("prices_by_micras", {}).get(micras_key)
-    if values is None:
-        return None
-
-    price_raw = values.get("price")
-    if price_raw is None:
-        return None
-
     try:
-        return float(price_raw)
+        micras_key = str(int(float(calibre_micras.strip())))
+    except ValueError:
+        return None
+    values = material.get("prices_by_micras", {}).get(micras_key)
+    if values is None or values.get("price") is None:
+        return None
+    try:
+        return float(values["price"])
     except (TypeError, ValueError):
         return None
 
@@ -169,7 +132,7 @@ class QuoteRequest(BaseModel):
     item_calibre: Annotated[str, Field(default="", alias="itemCalibre")]
     item_width: Annotated[str | int | float, Field(default="", alias="itemWidth")]
     monthly_scale: Annotated[str | int | float, Field(default="", alias="monthlyMeters")]
-    items: list[dict] = Field(default_factory=list, alias="items", max_length=4)
+    items: list[dict] = Field(default_factory=list, alias="items", max_length=MAX_ITEMS)
 
 
 app = FastAPI(title="Multivac Quote API", version="0.1.0")
@@ -189,52 +152,123 @@ app.add_middleware(
 
 @app.post("/api/quotes/generate")
 def generate_quote_excel(payload: QuoteRequest) -> FileResponse:
-    if not TEMPLATE_PATH.exists():
-        raise HTTPException(status_code=500, detail="Excel template not found")
-
     with NamedTemporaryFile(delete=False, suffix=".xlsx") as temp_file:
         output_path = temp_file.name
 
-    copy2(TEMPLATE_PATH, output_path)
-
     try:
-        workbook = load_workbook(output_path)
+        workbook = Workbook()
+        sheet = workbook.active
+        sheet.title = TARGET_SHEET_NAME
 
-        if TARGET_SHEET_NAME not in workbook.sheetnames:
-            available = ", ".join(workbook.sheetnames)
-            raise HTTPException(
-                status_code=500,
-                detail=(
-                    f'Sheet "{TARGET_SHEET_NAME}" was not found in template. '
-                    f"Available sheets: {available}"
-                ),
-            )
+        thin = Side(border_style="thin", color="111111")
+        border = Border(left=thin, right=thin, top=thin, bottom=thin)
+        center = Alignment(horizontal="center", vertical="center", wrap_text=True)
+        left = Alignment(horizontal="left", vertical="center", wrap_text=True)
+        dark_fill = PatternFill("solid", fgColor="2F2F2F")
+        light_fill = PatternFill("solid", fgColor="E8E8E8")
+        white_bold = Font(color="FFFFFF", bold=True)
+        bold = Font(bold=True)
 
-        sheet = workbook[TARGET_SHEET_NAME]
-        sheet["B8"] = payload.company_name
+        column_widths = {
+            "B": 25,
+            "C": 10,
+            "D": 14,
+            "E": 47,
+            "F": 8,
+            "G": 10,
+            "H": 11,
+            "I": 10,
+            "J": 11,
+            "K": 11,
+            "L": 11,
+        }
+        for col, width in column_widths.items():
+            sheet.column_dimensions[col].width = width
+
+        # Heading
+        sheet.merge_cells("B2:C2")
+        sheet["B2"] = "Version: 03"
+        sheet.merge_cells("B3:C3")
+        sheet["B3"] = "Pagina: 1"
+
+        sheet.merge_cells("I2:M2")
+        sheet["I2"] = "APPCOT"
+        sheet["I2"].font = Font(bold=True, size=18)
+        sheet.merge_cells("I3:M3")
+        sheet["I3"] = "Codigo: AM-400-000"
+
+        sheet.merge_cells("B5:D5")
+        sheet["B5"] = payload.company_name
+        sheet["B5"].fill = dark_fill
+        sheet["B5"].font = white_bold
+        sheet["B5"].alignment = left
+        sheet["B5"].border = border
+
         attention_name = payload.full_name.strip() or "Nombre y Apellido"
-        sheet["C8"] = f"Attn: {attention_name}"
-        sheet["K8"] = get_today_date_spanish()
+        sheet.merge_cells("E5:H5")
+        sheet["E5"] = f"Attn: {attention_name}"
+        sheet["E5"].fill = dark_fill
+        sheet["E5"].font = white_bold
+        sheet["E5"].alignment = center
+        sheet["E5"].border = border
+
+        sheet.merge_cells("I5:J5")
+        sheet["I5"] = "Fecha:"
+        sheet["I5"].fill = dark_fill
+        sheet["I5"].font = white_bold
+        sheet["I5"].alignment = center
+        sheet["I5"].border = border
+
+        sheet.merge_cells("K5:M5")
+        sheet["K5"] = get_today_date_spanish()
+        sheet["K5"].fill = dark_fill
+        sheet["K5"].font = Font(color="F28C28", bold=True)
+        sheet["K5"].alignment = center
+        sheet["K5"].border = border
+
+        # Table header
+        header_row = 7
+        sheet.row_dimensions[header_row].height = 42
+        headers = {
+            "B": "Estructura",
+            "C": "Tapa /\nFondo",
+            "D": "Linea/Producto",
+            "E": "Descripcion del Material",
+            "F": "Ancho\n(mm)",
+            "G": "Longitud\nde bobina\n(m)",
+            "H": "Volumen\nanual\nproyectado\n(mts)",
+            "I": "Escala\ncotizada\n(mts)",
+            "J": "Precio metro\n(USD)",
+            "K": "Precio bobina\n(USD)",
+            "L": "Precio Km\n(USD)",
+        }
+        for col, label in headers.items():
+            cell = sheet[f"{col}{header_row}"]
+            cell.value = label
+            cell.font = bold
+            cell.fill = light_fill
+            cell.alignment = center
+            cell.border = border
+
         monthly_value = parse_excel_number(payload.monthly_scale)
-
         product_label = payload.product_name.strip() or "AMILEN ML"
-        barrier = payload.barrier_type.strip().lower()
-        barrier_label = "Mediana barrera" if barrier == "mediana" else "Alta barrera"
-        seal_label = "pelable" if payload.seal_type.strip().lower() == "pelable" else "hermético"
 
-        normalized_items = payload.items[:4]
+        normalized_items = payload.items[:MAX_ITEMS]
         if not normalized_items:
             normalized_items = [
                 {
                     "type": payload.item_type.strip() or payload.product_side.strip(),
                     "calibre": payload.item_calibre.strip() or payload.top_calibre.strip(),
                     "width": payload.item_width,
+                    "barrierType": payload.barrier_type,
+                    "sealType": payload.seal_type,
                 }
             ]
+
         if not normalized_items:
             raise HTTPException(status_code=400, detail="At least one material item is required")
 
-        for index, item in enumerate(normalized_items[:4], start=1):
+        for index, item in enumerate(normalized_items, start=1):
             calibre_value = str(item.get("calibre", "")).strip()
             width_value = parse_excel_number(item.get("width"))
             if not calibre_value or width_value is None:
@@ -243,52 +277,111 @@ def generate_quote_excel(payload: QuoteRequest) -> FileResponse:
                     detail=f"Item #{index} must include both width and calibre",
                 )
 
-        base_row = 11
-        row_step = 4
-        max_items = 4
-        for index, item in enumerate(normalized_items[:max_items]):
-            row = base_row + index * row_step
-            detail_row = row + 2
-
+        data_start_row = 8
+        for index, item in enumerate(normalized_items[:MAX_ITEMS]):
+            row = data_start_row + index
             item_type = str(item.get("type", "")).strip().upper()
             item_type = item_type if item_type in {"TAPA", "FONDO"} else "TAPA"
             calibre = str(item.get("calibre", "")).strip()
-
             width_value = parse_excel_number(item.get("width"))
-            item_barrier = str(item.get("barrierType", payload.barrier_type)).strip().lower()
-            item_barrier_label = "Mediana barrera" if item_barrier == "mediana" else "Alta barrera"
-            item_seal = str(item.get("sealType", payload.seal_type)).strip().lower()
-            item_seal_label = "pelable" if item_seal == "pelable" else "hermético"
+            barrier = str(item.get("barrierType", "alta")).strip().lower()
+            seal = str(item.get("sealType", "hermetico")).strip().lower()
+            barrier_text = "mediana barrera" if barrier == "mediana" else "alta barrera"
+            seal_text = "pelable" if seal == "pelable" else "hermético"
+            milesimas = get_milesimas_for_material(product_label, calibre)
+            material_price = get_price_for_material(product_label, calibre)
 
             sheet[f"B{row}"] = f"{product_label} {calibre}".strip()
             sheet[f"C{row}"] = item_type
             sheet[f"D{row}"] = payload.line_product.strip()
-            sheet[f"F{row}"] = width_value if width_value is not None else ""
-            sheet[f"I{row}"] = monthly_value if monthly_value is not None else ""
-            sheet[f"D{detail_row}"] = item_barrier_label
-
-            milesimas = get_milesimas_for_material(product_label, calibre)
-            material_price = get_price_for_material(product_label, calibre)
             if milesimas:
-                sheet[f"E{detail_row}"] = (
-                    f"al alto vacío o MAP, sello {item_seal_label} {milesimas} mil de espesor"
+                sheet[f"E{row}"] = (
+                    f"Material coextruido y laminado, {barrier_text}, "
+                    f"sello {seal_text} {milesimas} mil de espesor"
                 )
             else:
-                current_desc = str(sheet[f"E{detail_row}"].value or "")
-                sheet[f"E{detail_row}"] = re.sub(
-                    r"hermético|pelable", item_seal_label, current_desc, flags=re.IGNORECASE
-                )
+                sheet[f"E{row}"] = f"Material coextruido y laminado, {barrier_text}, sello {seal_text}"
 
-            if material_price is not None:
-                sheet[f"R{row}"] = material_price
-            commission_factor = random.uniform(1.10, 1.25)
-            sheet[f"U{row}"] = f"=T{row}*{commission_factor:.2f}"
+            sheet[f"F{row}"] = width_value if width_value is not None else ""
+            sheet[f"G{row}"] = 914
+            sheet[f"H{row}"] = "TBD"
+            sheet[f"I{row}"] = monthly_value if monthly_value is not None else ""
 
-        used_count = len(normalized_items[:max_items])
-        for index in range(used_count, max_items):
-            row = base_row + index * row_step
-            detail_row = row + 2
-            clear_product_block(sheet, row, detail_row, "B", "W")
+            qmil = None
+            pmil = None
+            pbase = None
+            price_km = None
+            price_m = None
+            price_bobina = None
+            if material_price is not None and width_value is not None:
+                qmil = 100000 / float(width_value)
+                if qmil > 0:
+                    pmil = material_price / qmil
+                    pbase = pmil * COMMISSION_FACTOR
+                    price_km = pbase * 1000
+                    price_m = round(price_km / 1000, 3)
+                    price_bobina = round(price_m * 914, 2)
+                    sheet[f"J{row}"] = price_m
+                    sheet[f"K{row}"] = price_bobina
+                    sheet[f"L{row}"] = round(price_km, 2)
+                else:
+                    sheet[f"J{row}"] = ""
+                    sheet[f"K{row}"] = ""
+                    sheet[f"L{row}"] = ""
+            else:
+                sheet[f"J{row}"] = ""
+                sheet[f"K{row}"] = ""
+                sheet[f"L{row}"] = ""
+
+            for col in headers.keys():
+                cell = sheet[f"{col}{row}"]
+                cell.border = border
+                cell.alignment = left if col in {"B", "D", "E"} else center
+
+            sheet[f"I{row}"].number_format = "#,##0"
+            sheet[f"J{row}"].number_format = "$#,##0.000"
+            sheet[f"K{row}"].number_format = "$#,##0.00"
+            sheet[f"L{row}"].number_format = "$#,##0.00"
+
+        used_count = len(normalized_items[:MAX_ITEMS])
+        for index in range(used_count, MAX_ITEMS):
+            clear_product_row(sheet, data_start_row + index, "B", "L")
+
+        # Footer
+        footer_start = data_start_row + max(used_count, 1) + 2
+        footer_end = footer_start + 4
+        sheet.merge_cells(f"B{footer_start}:I{footer_start + 1}")
+        sheet[f"B{footer_start}"] = (
+            "Los precios anteriores son en USD(*), al tipo de cambio del dia de la facturacion, "
+            "no incluye IVA y son DDP, credito: Por definir."
+        )
+        sheet[f"B{footer_start}"].alignment = left
+        sheet[f"B{footer_start}"].border = border
+
+        sheet.merge_cells(f"B{footer_start + 2}:I{footer_end}")
+        sheet[f"B{footer_start + 2}"] = (
+            "Consulte los terminos y condiciones en la siguiente liga:\n"
+            "Terms and Conditions | APPCOT\n\n"
+            "Debido a la situacion actual de las materias primas y a las considerables "
+            "fluctuaciones de las mismas, nos reservamos el derecho de ajustar los precios.\n"
+            "La presente cancela cualquier cotizacion anterior y los precios son vigentes "
+            "durante un periodo de 15 dias."
+        )
+        sheet[f"B{footer_start + 2}"].alignment = left
+        sheet[f"B{footer_start + 2}"].border = border
+
+        sheet.merge_cells(f"J{footer_start}:L{footer_end}")
+        sheet[f"J{footer_start}"] = (
+            "APPCOT\n"
+            "Aldo Manzur Coronel\n"
+            "aldo.manzur@mx.multivac.com\n"
+            "Celular 55 3232 7977\n\n"
+            "[QR Placeholder]"
+        )
+        sheet[f"J{footer_start}"].alignment = center
+        sheet[f"J{footer_start}"].font = bold
+        sheet[f"J{footer_start}"].border = border
+
         workbook.save(output_path)
         workbook.close()
     except HTTPException:
@@ -310,17 +403,7 @@ def generate_quote_excel(payload: QuoteRequest) -> FileResponse:
 def get_tapa_calibres(
     material_name: Annotated[str, Query(alias="materialName")] = "Amilen ML",
 ) -> dict:
-    if not PRICES_PATH.exists():
-        raise HTTPException(status_code=500, detail="Prices file not found")
-
-    try:
-        with PRICES_PATH.open("r", encoding="utf-8") as file:
-            prices_data = json.load(file)
-    except Exception as exc:  # noqa: BLE001
-        raise HTTPException(status_code=500, detail=f"Failed to read prices: {exc}") from exc
-
-    tapas = prices_data.get("materiales", {}).get("tapas", [])
-    material = next((item for item in tapas if item.get("name") == material_name), None)
+    material = get_material_record(material_name)
     if material is None:
         raise HTTPException(status_code=404, detail=f'Material "{material_name}" not found')
 
