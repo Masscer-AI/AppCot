@@ -4,6 +4,8 @@ from tempfile import NamedTemporaryFile
 from typing import Annotated
 from datetime import datetime
 import json
+import re
+import random
 
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
@@ -48,10 +50,126 @@ def get_today_date_spanish() -> str:
     return f"{today.day} de {month_name} de {today.year}"
 
 
+def parse_excel_number(value: str | int | float | None) -> int | float | None:
+    if value is None:
+        return None
+
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return int(value) if value.is_integer() else value
+
+    text = str(value).strip().replace(",", "")
+    if not text:
+        return None
+
+    try:
+        parsed = float(text)
+        return int(parsed) if parsed.is_integer() else parsed
+    except ValueError:
+        return None
+
+
+def clear_product_block(sheet, start_row: int, end_row: int, start_col: str = "B", end_col: str = "W") -> None:
+    for row in range(start_row, end_row + 1):
+        for col_ord in range(ord(start_col), ord(end_col) + 1):
+            sheet[f"{chr(col_ord)}{row}"] = None
+
+
+def get_milesimas_for_material(material_name: str, calibre_micras: str) -> str | None:
+    if not PRICES_PATH.exists():
+        return None
+
+    micras_key = calibre_micras.strip()
+    if not micras_key:
+        return None
+
+    try:
+        micras_key = str(int(float(micras_key)))
+    except ValueError:
+        return None
+
+    try:
+        with PRICES_PATH.open("r", encoding="utf-8") as file:
+            prices_data = json.load(file)
+    except Exception:  # noqa: BLE001
+        return None
+
+    tapas = prices_data.get("materiales", {}).get("tapas", [])
+    material = next(
+        (item for item in tapas if str(item.get("name", "")).strip().lower() == material_name.strip().lower()),
+        None,
+    )
+    if material is None:
+        return None
+
+    values = material.get("prices_by_micras", {}).get(micras_key)
+    if values is None:
+        return None
+
+    milesimas_raw = values.get("espesor_milesimas")
+    if milesimas_raw is None:
+        return None
+
+    return f"{float(milesimas_raw):.1f}"
+
+
+def get_price_for_material(material_name: str, calibre_micras: str) -> float | None:
+    if not PRICES_PATH.exists():
+        return None
+
+    micras_key = calibre_micras.strip()
+    if not micras_key:
+        return None
+
+    try:
+        micras_key = str(int(float(micras_key)))
+    except ValueError:
+        return None
+
+    try:
+        with PRICES_PATH.open("r", encoding="utf-8") as file:
+            prices_data = json.load(file)
+    except Exception:  # noqa: BLE001
+        return None
+
+    tapas = prices_data.get("materiales", {}).get("tapas", [])
+    material = next(
+        (item for item in tapas if str(item.get("name", "")).strip().lower() == material_name.strip().lower()),
+        None,
+    )
+    if material is None:
+        return None
+
+    values = material.get("prices_by_micras", {}).get(micras_key)
+    if values is None:
+        return None
+
+    price_raw = values.get("price")
+    if price_raw is None:
+        return None
+
+    try:
+        return float(price_raw)
+    except (TypeError, ValueError):
+        return None
+
+
 class QuoteRequest(BaseModel):
     model_config = ConfigDict(populate_by_name=True)
     company_name: Annotated[str, Field(min_length=1, alias="companyName")]
     full_name: Annotated[str, Field(default="", alias="fullName")]
+    product_name: Annotated[str, Field(default="AMILEN ML", alias="productName")]
+    top_calibre: Annotated[str, Field(default="", alias="topCalibre")]
+    product_side: Annotated[str, Field(default="TAPA", alias="productSide")]
+    line_product: Annotated[str, Field(default="", alias="lineProduct")]
+    barrier_type: Annotated[str, Field(default="alta", alias="barrierType")]
+    seal_type: Annotated[str, Field(default="hermetico", alias="sealType")]
+    item_type: Annotated[str, Field(default="", alias="itemType")]
+    item_calibre: Annotated[str, Field(default="", alias="itemCalibre")]
+    item_width: Annotated[str | int | float, Field(default="", alias="itemWidth")]
+    monthly_scale: Annotated[str | int | float, Field(default="", alias="monthlyMeters")]
+    items: list[dict] = Field(default_factory=list, alias="items", max_length=4)
 
 
 app = FastAPI(title="Multivac Quote API", version="0.1.0")
@@ -97,6 +215,80 @@ def generate_quote_excel(payload: QuoteRequest) -> FileResponse:
         attention_name = payload.full_name.strip() or "Nombre y Apellido"
         sheet["C8"] = f"Attn: {attention_name}"
         sheet["K8"] = get_today_date_spanish()
+        monthly_value = parse_excel_number(payload.monthly_scale)
+
+        product_label = payload.product_name.strip() or "AMILEN ML"
+        barrier = payload.barrier_type.strip().lower()
+        barrier_label = "Mediana barrera" if barrier == "mediana" else "Alta barrera"
+        seal_label = "pelable" if payload.seal_type.strip().lower() == "pelable" else "hermético"
+
+        normalized_items = payload.items[:4]
+        if not normalized_items:
+            normalized_items = [
+                {
+                    "type": payload.item_type.strip() or payload.product_side.strip(),
+                    "calibre": payload.item_calibre.strip() or payload.top_calibre.strip(),
+                    "width": payload.item_width,
+                }
+            ]
+        if not normalized_items:
+            raise HTTPException(status_code=400, detail="At least one material item is required")
+
+        for index, item in enumerate(normalized_items[:4], start=1):
+            calibre_value = str(item.get("calibre", "")).strip()
+            width_value = parse_excel_number(item.get("width"))
+            if not calibre_value or width_value is None:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Item #{index} must include both width and calibre",
+                )
+
+        base_row = 11
+        row_step = 4
+        max_items = 4
+        for index, item in enumerate(normalized_items[:max_items]):
+            row = base_row + index * row_step
+            detail_row = row + 2
+
+            item_type = str(item.get("type", "")).strip().upper()
+            item_type = item_type if item_type in {"TAPA", "FONDO"} else "TAPA"
+            calibre = str(item.get("calibre", "")).strip()
+
+            width_value = parse_excel_number(item.get("width"))
+            item_barrier = str(item.get("barrierType", payload.barrier_type)).strip().lower()
+            item_barrier_label = "Mediana barrera" if item_barrier == "mediana" else "Alta barrera"
+            item_seal = str(item.get("sealType", payload.seal_type)).strip().lower()
+            item_seal_label = "pelable" if item_seal == "pelable" else "hermético"
+
+            sheet[f"B{row}"] = f"{product_label} {calibre}".strip()
+            sheet[f"C{row}"] = item_type
+            sheet[f"D{row}"] = payload.line_product.strip()
+            sheet[f"F{row}"] = width_value if width_value is not None else ""
+            sheet[f"I{row}"] = monthly_value if monthly_value is not None else ""
+            sheet[f"D{detail_row}"] = item_barrier_label
+
+            milesimas = get_milesimas_for_material(product_label, calibre)
+            material_price = get_price_for_material(product_label, calibre)
+            if milesimas:
+                sheet[f"E{detail_row}"] = (
+                    f"al alto vacío o MAP, sello {item_seal_label} {milesimas} mil de espesor"
+                )
+            else:
+                current_desc = str(sheet[f"E{detail_row}"].value or "")
+                sheet[f"E{detail_row}"] = re.sub(
+                    r"hermético|pelable", item_seal_label, current_desc, flags=re.IGNORECASE
+                )
+
+            if material_price is not None:
+                sheet[f"R{row}"] = material_price
+            commission_factor = random.uniform(1.10, 1.25)
+            sheet[f"U{row}"] = f"=T{row}*{commission_factor:.2f}"
+
+        used_count = len(normalized_items[:max_items])
+        for index in range(used_count, max_items):
+            row = base_row + index * row_step
+            detail_row = row + 2
+            clear_product_block(sheet, row, detail_row, "B", "W")
         workbook.save(output_path)
         workbook.close()
     except HTTPException:

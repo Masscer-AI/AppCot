@@ -71,7 +71,7 @@
                         "density_g_m2": 177.2
                     },
                     "200": {
-                        "espesor_milesimas": 7.9,
+                        "espesor_milesimas": 7.9, 
                         "price": 122.73,
                         "price_unit": "USD",
                         "density_g_m2": 197.5
