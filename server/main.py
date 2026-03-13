@@ -3,6 +3,7 @@ from tempfile import NamedTemporaryFile
 from typing import Annotated, Any
 from datetime import datetime, timedelta, timezone
 import base64
+import csv
 import hashlib
 import json
 import logging
@@ -353,6 +354,11 @@ class CotizacionCreateRequest(BaseModel):
     monthly_meters: float | None = Field(default=None, alias="monthlyMeters")
     product_name: str = Field(default="Flex GL", alias="productName")
     items: list[QuoteItemPayload] = Field(default_factory=list, max_length=MAX_ITEMS)
+
+
+class LoginRequest(BaseModel):
+    email: str
+    password: str
 
 
 class MagicLinkRequest(BaseModel):
@@ -846,6 +852,78 @@ def create_cotizacion(payload: CotizacionCreateRequest) -> dict:
         "id": cotizacion_id,
         "status": "pending",
         "message": "Tu solicitud fue enviada. Un miembro del personal terminara la cotizacion y te llegara por correo.",
+    }
+
+
+USERS_CSV_PATH = BASE_DIR / "users.csv"
+
+
+def load_csv_users() -> list[dict]:
+    if not USERS_CSV_PATH.exists():
+        return []
+    with USERS_CSV_PATH.open(newline="", encoding="utf-8") as f:
+        return list(csv.DictReader(f))
+
+
+def find_csv_user(email: str, password: str) -> dict | None:
+    for row in load_csv_users():
+        if row.get("email", "").strip().lower() == email and row.get("password", "") == password:
+            return row
+    return None
+
+
+@app.post("/api/auth/login")
+def login(payload: LoginRequest, response: Response) -> dict:
+    email = payload.email.strip().lower()
+    logger.info("auth/login attempt | email=%s", email)
+    csv_user = find_csv_user(email, payload.password)
+    if csv_user is None:
+        logger.warning("auth/login failed | email=%s", email)
+        raise HTTPException(status_code=401, detail="Credenciales incorrectas")
+
+    conn = db_connect()
+    now = iso_now()
+    try:
+        existing = conn.execute("SELECT id FROM users WHERE email = ?", (email,)).fetchone()
+        if existing is None:
+            cur = conn.execute(
+                "INSERT INTO users (email, name, role, is_active, created_at) VALUES (?, ?, ?, ?, ?)",
+                (email, csv_user.get("name", email.split("@")[0]), "cotizador", 1, now),
+            )
+            user_id = cur.lastrowid
+        else:
+            user_id = existing["id"]
+
+        session_raw = secrets.token_urlsafe(32)
+        session_hash = hash_token(session_raw)
+        session_exp = (utcnow() + timedelta(days=7)).isoformat()
+        conn.execute(
+            "INSERT INTO session_tokens (user_id, token_hash, expires_at, created_at) VALUES (?, ?, ?, ?)",
+            (user_id, session_hash, session_exp, now),
+        )
+        conn.commit()
+        user = conn.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
+        logger.info("auth/login OK | email=%s | user_id=%s", email, user_id)
+    finally:
+        conn.close()
+
+    response.set_cookie(
+        key=SESSION_COOKIE_NAME,
+        value=session_raw,
+        httponly=True,
+        samesite="lax",
+        secure=False,
+        max_age=7 * 24 * 60 * 60,
+        path="/",
+    )
+    return {
+        "ok": True,
+        "user": {
+            "id": user["id"],
+            "email": user["email"],
+            "name": user["name"],
+            "role": user["role"],
+        },
     }
 
 
