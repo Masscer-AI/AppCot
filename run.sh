@@ -34,6 +34,12 @@ cleanup() {
 
 trap cleanup INT TERM EXIT
 
+echo "Installing server dependencies..."
+(cd "$SERVER_DIR" && uv sync)
+
+echo "Installing client dependencies..."
+(cd "$CLIENT_DIR" && npm install)
+
 echo "Starting backend on http://127.0.0.1:8009 ..."
 (
   cd "$SERVER_DIR"

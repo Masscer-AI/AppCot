@@ -5,12 +5,20 @@ from datetime import datetime, timedelta, timezone
 import base64
 import hashlib
 import json
+import logging
 import os
 import secrets
 import sqlite3
 import urllib.error
 import urllib.request
 from io import BytesIO
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+logger = logging.getLogger("appcot")
 
 from fastapi import Cookie, FastAPI, HTTPException, Query, Response
 from fastapi.middleware.cors import CORSMiddleware
@@ -97,6 +105,7 @@ def db_connect() -> sqlite3.Connection:
 
 
 def init_db() -> None:
+    logger.info("Initializing database at %s", DB_PATH)
     conn = db_connect()
     try:
         conn.executescript(
@@ -172,6 +181,7 @@ def init_db() -> None:
             """
         )
         conn.commit()
+        logger.info("Database initialized OK")
     finally:
         conn.close()
 
@@ -304,19 +314,24 @@ def send_email_with_resend(
         },
         method="POST",
     )
+    logger.info("Sending email via Resend to %s | subject: %s", recipients, subject)
     try:
         with urllib.request.urlopen(request, timeout=20) as response:  # noqa: S310
             response_body = response.read().decode("utf-8")
             parsed = json.loads(response_body) if response_body else {}
+            provider_id = parsed.get("id")
+            logger.info("Resend accepted email | provider_id=%s | to=%s", provider_id, recipients)
             return {
                 "status_code": response.status,
-                "provider_id": parsed.get("id"),
+                "provider_id": provider_id,
                 "raw_response": parsed,
             }
     except urllib.error.HTTPError as exc:
         details = exc.read().decode("utf-8", errors="replace")
+        logger.error("Resend HTTP error %s | to=%s | body=%s", exc.code, recipients, details)
         raise RuntimeError(f"Resend HTTP {exc.code}: {details}") from exc
     except urllib.error.URLError as exc:
+        logger.error("Resend connection error | to=%s | reason=%s", recipients, exc.reason)
         raise RuntimeError(f"Resend connection error: {exc.reason}") from exc
 
 
@@ -354,6 +369,7 @@ class CotizacionUpdateRequest(BaseModel):
     reviewNotes: str | None = None
     lineProduct: str | None = None
     monthlyMeters: float | None = None
+    emails: list[str] | None = None
     items: list[dict[str, Any]] | None = None
 
 
@@ -367,6 +383,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+logger.info("Starting AppCot API | DB=%s | EMAIL_MODE=%s | EMAIL_FROM=%s", DB_PATH, EMAIL_MODE, EMAIL_FROM)
 init_db()
 
 
@@ -757,6 +774,7 @@ def build_quote_email_html(cotizacion_id: int, company_name: str, full_name: str
 
 @app.post("/api/cotizaciones")
 def create_cotizacion(payload: CotizacionCreateRequest) -> dict:
+    logger.info("create_cotizacion | company=%s | emails=%s | items=%d", payload.company_name, payload.emails, len(payload.items))
     if not payload.items:
         raise HTTPException(status_code=400, detail="At least one item is required")
     if len(payload.items) > MAX_ITEMS:
@@ -823,6 +841,7 @@ def create_cotizacion(payload: CotizacionCreateRequest) -> dict:
     finally:
         conn.close()
 
+    logger.info("Cotizacion created | id=%s | company=%s", cotizacion_id, payload.company_name)
     return {
         "id": cotizacion_id,
         "status": "pending",
@@ -833,7 +852,9 @@ def create_cotizacion(payload: CotizacionCreateRequest) -> dict:
 @app.post("/api/auth/magic-link/request")
 def request_magic_link(payload: MagicLinkRequest) -> dict:
     email = payload.email.strip().lower()
+    logger.info("magic-link/request | email=%s", email)
     if "@" not in email:
+        logger.warning("magic-link/request rejected | invalid email=%s", email)
         raise HTTPException(status_code=400, detail="Invalid email")
 
     conn = db_connect()
@@ -865,6 +886,7 @@ def request_magic_link(payload: MagicLinkRequest) -> dict:
     finally:
         conn.close()
 
+    logger.info("magic-link/request OK | email=%s | expires_at=%s", email, expires_at)
     return {
         "ok": True,
         "message": "Magic link generado (stub).",
@@ -875,6 +897,7 @@ def request_magic_link(payload: MagicLinkRequest) -> dict:
 
 @app.post("/api/auth/magic-link/verify")
 def verify_magic_link(payload: MagicLinkVerifyRequest, response: Response) -> dict:
+    logger.info("magic-link/verify attempt")
     token_hash = hash_token(payload.token.strip())
     now = iso_now()
     conn = db_connect()
@@ -889,6 +912,7 @@ def verify_magic_link(payload: MagicLinkVerifyRequest, response: Response) -> di
             (token_hash, now),
         ).fetchone()
         if token_row is None:
+            logger.warning("magic-link/verify failed | token invalid or expired")
             raise HTTPException(status_code=401, detail="Invalid or expired token")
 
         conn.execute("UPDATE magic_link_tokens SET used_at = ? WHERE id = ?", (now, token_row["id"]))
@@ -902,6 +926,7 @@ def verify_magic_link(payload: MagicLinkVerifyRequest, response: Response) -> di
         conn.commit()
 
         user = conn.execute("SELECT * FROM users WHERE id = ?", (token_row["user_id"],)).fetchone()
+        logger.info("magic-link/verify OK | user_id=%s | email=%s", user["id"], user["email"])
     finally:
         conn.close()
 
@@ -1020,7 +1045,9 @@ def update_cotizacion(
     payload: CotizacionUpdateRequest,
     session_cookie: str | None = Cookie(default=None, alias=SESSION_COOKIE_NAME),
 ) -> dict:
-    _ = get_current_user(session_cookie)
+    user = get_current_user(session_cookie)
+    logger.info("update_cotizacion | id=%s | by=%s | fields=%s", cotizacion_id, user["email"],
+        [k for k, v in payload.model_dump().items() if v is not None])
     conn = db_connect()
     now = iso_now()
     try:
@@ -1039,6 +1066,9 @@ def update_cotizacion(
         if payload.monthlyMeters is not None:
             updates.append("monthly_meters = ?")
             values.append(payload.monthlyMeters)
+        if payload.emails is not None:
+            updates.append("emails_json = ?")
+            values.append(json.dumps(payload.emails))
 
         if updates:
             updates.append("updated_at = ?")
@@ -1087,6 +1117,21 @@ def update_cotizacion(
     return {"ok": True}
 
 
+@app.delete("/api/cotizaciones/{cotizacion_id}")
+def delete_cotizacion(
+    cotizacion_id: int, session_cookie: str | None = Cookie(default=None, alias=SESSION_COOKIE_NAME)
+) -> dict:
+    _ = get_current_user(session_cookie)
+    conn = db_connect()
+    try:
+        _ = fetch_cotizacion(conn, cotizacion_id)
+        conn.execute("DELETE FROM cotizaciones WHERE id = ?", (cotizacion_id,))
+        conn.commit()
+    finally:
+        conn.close()
+    return {"ok": True, "deleted_id": cotizacion_id}
+
+
 @app.get("/api/cotizaciones/{cotizacion_id}/excel")
 def preview_cotizacion_excel(
     cotizacion_id: int, session_cookie: str | None = Cookie(default=None, alias=SESSION_COOKIE_NAME)
@@ -1120,6 +1165,7 @@ def approve_cotizacion(
     cotizacion_id: int, session_cookie: str | None = Cookie(default=None, alias=SESSION_COOKIE_NAME)
 ) -> dict:
     user = get_current_user(session_cookie)
+    logger.info("approve_cotizacion | id=%s | by=%s", cotizacion_id, user["email"])
     conn = db_connect()
     now = iso_now()
     try:
@@ -1136,9 +1182,12 @@ def approve_cotizacion(
 
         recipients = [str(email).strip() for email in json.loads(cotizacion["emails_json"]) if str(email).strip()]
         if not recipients and EMAIL_REPLY_TO:
+            logger.info("approve_cotizacion | id=%s | no recipients in DB, falling back to EMAIL_REPLY_TO=%s", cotizacion_id, EMAIL_REPLY_TO)
             recipients = [EMAIL_REPLY_TO]
         if not recipients:
+            logger.error("approve_cotizacion | id=%s | no recipients configured", cotizacion_id)
             raise HTTPException(status_code=400, detail="No hay correos configurados para esta cotizacion")
+        logger.info("approve_cotizacion | id=%s | recipients=%s | email_mode=%s", cotizacion_id, recipients, EMAIL_MODE)
 
         subject = f"Cotizacion #{cotizacion_id} aprobada"
         body_preview = (
@@ -1159,20 +1208,25 @@ def approve_cotizacion(
                         "content": base64.b64encode(pdf_bytes).decode("utf-8"),
                     }
                 ]
-                resend_result = send_email_with_resend(
-                    recipients=recipients,
-                    subject=subject,
-                    html_body=build_quote_email_html(
-                        cotizacion_id=cotizacion_id,
-                        company_name=cotizacion["company_name"],
-                        full_name=cotizacion["full_name"],
-                    ),
-                    text_body=body_preview,
-                    attachments=attachments,
-                )
-                provider_id = resend_result.get("provider_id")
-                email_log_suffix = f"resend_sent id={provider_id}" if provider_id else "resend_sent"
+                provider_ids: list[str] = []
+                for recipient in recipients:
+                    resend_result = send_email_with_resend(
+                        recipients=[recipient],
+                        subject=subject,
+                        html_body=build_quote_email_html(
+                            cotizacion_id=cotizacion_id,
+                            company_name=cotizacion["company_name"],
+                            full_name=cotizacion["full_name"],
+                        ),
+                        text_body=body_preview,
+                        attachments=attachments,
+                    )
+                    provider_id = resend_result.get("provider_id")
+                    if provider_id:
+                        provider_ids.append(str(provider_id))
+                email_log_suffix = f"resend_sent ids={','.join(provider_ids)}" if provider_ids else "resend_sent"
             except RuntimeError as exc:
+                logger.error("approve_cotizacion | id=%s | email send failed: %s", cotizacion_id, exc)
                 raise HTTPException(status_code=502, detail=f"No se pudo enviar correo con Resend: {exc}") from exc
 
         conn.execute(
@@ -1189,6 +1243,7 @@ def approve_cotizacion(
             ),
         )
         conn.commit()
+        logger.info("approve_cotizacion | id=%s | done | delivery=%s", cotizacion_id, email_log_suffix)
     finally:
         conn.close()
     return {"ok": True, "status": "completed", "email_mode": EMAIL_MODE}
@@ -1211,6 +1266,30 @@ def get_tapa_calibres(
         calibres.append({"micras": micras, "milesimas": milesimas})
     calibres.sort(key=lambda item: item["micras"])
     return {"material": material_name, "calibres": calibres}
+
+
+@app.get("/api/debug/email-status/{email_id}")
+def get_email_status(email_id: str) -> dict:
+    """Query Resend API for the delivery status of a sent email."""
+    if not RESEND_API_KEY:
+        raise HTTPException(status_code=503, detail="RESEND_API_KEY not configured")
+    url = f"https://api.resend.com/emails/{email_id}"
+    request = urllib.request.Request(
+        url,
+        headers={
+            "Authorization": f"Bearer {RESEND_API_KEY}",
+            "User-Agent": "appcot-backend/0.1",
+        },
+        method="GET",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=15) as response:  # noqa: S310
+            parsed = json.loads(response.read().decode("utf-8"))
+            logger.info("email_status | id=%s | status=%s | last_event=%s", email_id, parsed.get("last_event"), parsed.get("created_at"))
+            return parsed
+    except urllib.error.HTTPError as exc:
+        details = exc.read().decode("utf-8", errors="replace")
+        raise HTTPException(status_code=exc.code, detail=details) from exc
 
 
 if __name__ == "__main__":
