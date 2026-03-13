@@ -1,9 +1,8 @@
 {
-    "materiales": {
-        "tapas": [
-            {
-                "name": "Amilen ML",
-                "prices_by_micras": {
+    "materiales": [
+        {
+            "name": "Flex GL",
+            "prices_by_micras": {
                     "50": {
                         "espesor_milesimas": 2.0,
                         "price": 30.89,
@@ -88,8 +87,7 @@
                         "price_unit": "USD",
                         "density_g_m2": 247.1
                     }
-                }
             }
-        ]
-    }
+        }
+    ]
 }

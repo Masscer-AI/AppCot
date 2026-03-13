@@ -10,7 +10,7 @@ python main.py
 
 API will run at:
 
-- `http://127.0.0.1:8009`
+- `http://localhost:8009`
 
 ## Manual setup
 
